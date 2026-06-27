@@ -1,6 +1,4 @@
 // Lógica pura del planificador de turnos sabatinos.
-// Portada fielmente desde la demo original (sin dependencias de React ni de BD),
-// para poder reutilizarla tanto en el cliente como en el servidor.
 
 export type Rol = "Ventas" | "Soporte" | "Contabilidad" | "Administración";
 export type Modalidad = "Presencial" | "Virtual";
@@ -20,12 +18,11 @@ export interface Asignacion {
 }
 
 export interface Sabado {
-  key: string; // 'YYYY-MM-DD'
+  key: string;
   day: number;
-  label: string; // 'Sáb 3'
+  label: string;
 }
 
-// La planificación cubre enero–junio 2026 (igual que la demo original).
 export const MONTHS = [
   { name: "Enero", year: 2026, month: 0 },
   { name: "Febrero", year: 2026, month: 1 },
@@ -77,7 +74,6 @@ export function shiftStyle(sh: Turno | null): ShiftStyle {
   return C[sh];
 }
 
-// Ciclo de turnos al hacer clic: vacío → AM → PM → COMPLETO → LIBRE → AM …
 export function nextShift(cur: Turno | null): Turno {
   if (cur == null) return "AM";
   if (cur === "AM") return "PM";
@@ -87,7 +83,6 @@ export function nextShift(cur: Turno | null): Turno {
 }
 
 export function getSaturdays(year: number, month: number): Sabado[] {
-  // Cálculo en UTC para que el día de la semana no dependa de la zona horaria del servidor.
   const last = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
   const out: Sabado[] = [];
   for (let d = 1; d <= last; d++) {
@@ -104,7 +99,6 @@ export function saturdaysForMonth(monthIndex: number): Sabado[] {
   return getSaturdays(cm.year, cm.month);
 }
 
-// Sábados de quincena: el más cercano al 15 y al 30 (o último día).
 export function quincenaKeys(year: number, month: number): Set<string> {
   const sats = getSaturdays(year, month);
   const last = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
@@ -117,14 +111,8 @@ export function quincenaKeys(year: number, month: number): Set<string> {
   for (const s of sats) {
     const d1 = Math.abs(s.day - t1);
     const d2 = Math.abs(s.day - t2);
-    if (d1 < b1) {
-      b1 = d1;
-      s1 = s.key;
-    }
-    if (d2 < b2) {
-      b2 = d2;
-      s2 = s.key;
-    }
+    if (d1 < b1) { b1 = d1; s1 = s.key; }
+    if (d2 < b2) { b2 = d2; s2 = s.key; }
   }
   const keys = new Set<string>();
   if (s1) keys.add(s1);
@@ -141,69 +129,105 @@ function leastShift(counts: ShiftCounts): keyof ShiftCounts {
   return m;
 }
 
-// Asigna turnos a los trabajadores de un sábado respetando las reglas:
-// - al menos un vendedor en mañana y tarde
-// - en quincena se prioriza contabilidad en turno
-// - al menos un colaborador presencial cubriendo mañana y tarde
-function assignSat(workers: Colaborador[], isQ: boolean): Record<number, Turno> {
+// Asigna turnos respetando:
+// - Reglas de ventas, contabilidad en quincena y presencial
+// - Máximo 1 COMPLETO por colaborador al mes (via completoUsed)
+// - En quincena: mínimo 2 colaboradores cubriendo AM (AM+COMPLETO) y 2 cubriendo PM
+function assignSat(
+  workers: Colaborador[],
+  isQ: boolean,
+  completoUsed: Set<number>,
+): Record<number, Turno> {
   const res: Record<number, Turno> = {};
   const counts: ShiftCounts = { AM: 0, PM: 0, COMPLETO: 0 };
+
+  const canCompleto = (c: Colaborador) => !completoUsed.has(c.id);
+
+  function doAssign(c: Colaborador, preferred: keyof ShiftCounts) {
+    let sh: keyof ShiftCounts = preferred;
+    if (sh === "COMPLETO" && !canCompleto(c)) {
+      sh = counts.AM <= counts.PM ? "AM" : "PM";
+    }
+    res[c.id] = sh;
+    counts[sh]++;
+  }
+
   const ventas = workers.filter((c) => c.rol === "Ventas");
   const rest = workers.filter((c) => c.rol !== "Ventas");
 
   if (ventas.length === 1) {
-    res[ventas[0].id] = "COMPLETO";
-    counts.COMPLETO++;
+    doAssign(ventas[0], "COMPLETO");
   } else if (ventas.length >= 2) {
-    res[ventas[0].id] = "AM";
-    counts.AM++;
-    res[ventas[1].id] = "PM";
-    counts.PM++;
-    ventas.slice(2).forEach((v) => {
-      const sh = leastShift(counts);
-      res[v.id] = sh;
-      counts[sh]++;
-    });
+    res[ventas[0].id] = "AM"; counts.AM++;
+    res[ventas[1].id] = "PM"; counts.PM++;
+    ventas.slice(2).forEach((v) => doAssign(v, leastShift(counts)));
   }
 
   if (isQ) {
     const contab = rest.filter((c) => c.rol === "Contabilidad" && !res[c.id]);
     if (contab.length) {
-      res[contab[0].id] = "COMPLETO";
-      counts.COMPLETO++;
+      doAssign(contab[0], canCompleto(contab[0]) ? "COMPLETO" : leastShift(counts));
     }
   }
 
   rest.forEach((c) => {
-    if (!res[c.id]) {
-      const sh = leastShift(counts);
-      res[c.id] = sh;
-      counts[sh]++;
-    }
+    if (!res[c.id]) doAssign(c, leastShift(counts));
   });
 
+  // Presencial: al menos uno en AM y uno en PM
   const pres = workers.filter((c) => c.modalidad === "Presencial");
   if (pres.length) {
     const hasAm = pres.some((c) => res[c.id] === "AM" || res[c.id] === "COMPLETO");
     const hasPm = pres.some((c) => res[c.id] === "PM" || res[c.id] === "COMPLETO");
     if (!hasAm || !hasPm) {
-      const cand = pres.find((c) => res[c.id] !== "COMPLETO") ?? pres[0];
-      res[cand.id] = "COMPLETO";
+      const cand = pres.find((c) => res[c.id] !== "COMPLETO" && canCompleto(c));
+      if (cand) {
+        const prev = res[cand.id] as keyof ShiftCounts;
+        counts[prev]--;
+        res[cand.id] = "COMPLETO";
+        counts.COMPLETO++;
+      }
+    }
+  }
+
+  // Quincena: mínimo 2 cubriendo AM (AM+COMPLETO) y 2 cubriendo PM
+  if (isQ) {
+    const amCov = () =>
+      Object.values(res).filter((t) => t === "AM" || t === "COMPLETO").length;
+    const pmCov = () =>
+      Object.values(res).filter((t) => t === "PM" || t === "COMPLETO").length;
+
+    for (let iter = 0; iter < workers.length; iter++) {
+      const needAm = amCov() < 2;
+      const needPm = pmCov() < 2;
+      if (!needAm && !needPm) break;
+
+      // Promover un trabajador de PM a COMPLETO → cubre también AM
+      if (needAm) {
+        const c = workers.find((w) => res[w.id] === "PM" && canCompleto(w));
+        if (c) { counts.PM--; res[c.id] = "COMPLETO"; counts.COMPLETO++; continue; }
+      }
+      // Promover un trabajador de AM a COMPLETO → cubre también PM
+      if (needPm) {
+        const c = workers.find((w) => res[w.id] === "AM" && canCompleto(w));
+        if (c) { counts.AM--; res[c.id] = "COMPLETO"; counts.COMPLETO++; continue; }
+      }
+      break; // No se puede mejorar más
     }
   }
 
   return res;
 }
 
-// Genera una planificación completa para un mes y la devuelve como lista plana
-// de asignaciones (lista para persistir).
+// Genera planificación completa para un mes.
+// Reglas: 1 LIBRE por colaborador · 1 COMPLETO máximo por colaborador ·
+// quincena: contabilidad activa + mínimo 2 por turno AM y PM.
 export function buildPlan(monthIndex: number, collabs: Colaborador[]): Asignacion[] {
   const cm = MONTHS[monthIndex];
   const sats = getSaturdays(cm.year, cm.month);
   const qset = quincenaKeys(cm.year, cm.month);
 
-  // Un sábado libre al mes por colaborador, balanceando y respetando la
-  // quincena para contabilidad.
+  // Asignar un sábado LIBRE por colaborador (sin quincena para contabilidad)
   const libreCount: Record<string, number> = {};
   sats.forEach((s) => (libreCount[s.key] = 0));
   const libreOf: Record<number, string> = {};
@@ -216,19 +240,23 @@ export function buildPlan(monthIndex: number, collabs: Colaborador[]): Asignacio
     let best = rot[0];
     let bestScore = Infinity;
     rot.forEach((s) => {
-      if (libreCount[s.key] < bestScore) {
-        bestScore = libreCount[s.key];
-        best = s;
-      }
+      if (libreCount[s.key] < bestScore) { bestScore = libreCount[s.key]; best = s; }
     });
     libreOf[c.id] = best.key;
     libreCount[best.key]++;
   });
 
+  // Registrar qué colaboradores ya usaron su COMPLETO del mes
+  const completoUsed = new Set<number>();
+
   const out: Asignacion[] = [];
   sats.forEach((s) => {
     const workers = collabs.filter((c) => libreOf[c.id] !== s.key);
-    const res = assignSat(workers, qset.has(s.key));
+    const res = assignSat(workers, qset.has(s.key), completoUsed);
+    // Actualizar completoUsed para los siguientes sábados
+    for (const idStr of Object.keys(res)) {
+      if (res[Number(idStr)] === "COMPLETO") completoUsed.add(Number(idStr));
+    }
     collabs.forEach((c) => {
       const turno: Turno = libreOf[c.id] === s.key ? "LIBRE" : (res[c.id] ?? "AM");
       out.push({ colaboradorId: c.id, fecha: s.key, turno });

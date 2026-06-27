@@ -1,9 +1,10 @@
 "use server";
 
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { db } from "@/lib/db";
 import { colaboradores, asignaciones } from "@/lib/db/schema";
+import { getSessionUserId } from "@/lib/auth";
 import {
   buildPlan,
   saturdaysForMonth,
@@ -16,7 +17,6 @@ import {
   type Colaborador,
 } from "@/lib/planner";
 
-// --- Validación de entrada (las Server Actions son endpoints públicos) ---
 const TURNOS: Turno[] = ["AM", "PM", "COMPLETO", "LIBRE"];
 
 const asRol = (v: unknown): Rol | null =>
@@ -38,7 +38,13 @@ const asMonthIndex = (v: unknown): number | null => {
 const asFecha = (v: unknown): string | null =>
   typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : null;
 
-async function colaboradoresActuales(): Promise<Colaborador[]> {
+async function requireSession(): Promise<number> {
+  const userId = await getSessionUserId();
+  if (!userId) throw new Error("No autenticado");
+  return userId;
+}
+
+async function colaboradoresActuales(userId: number): Promise<Colaborador[]> {
   return db
     .select({
       id: colaboradores.id,
@@ -47,6 +53,7 @@ async function colaboradoresActuales(): Promise<Colaborador[]> {
       modalidad: colaboradores.modalidad,
     })
     .from(colaboradores)
+    .where(eq(colaboradores.usuarioId, userId))
     .orderBy(colaboradores.id);
 }
 
@@ -55,6 +62,7 @@ export async function addCollaborator(input: {
   rol: Rol;
   modalidad: Modalidad;
 }) {
+  const userId = await requireSession();
   const nombre = (input?.nombre ?? "").trim();
   const rol = asRol(input?.rol);
   const modalidad = asModalidad(input?.modalidad);
@@ -62,7 +70,7 @@ export async function addCollaborator(input: {
 
   const [row] = await db
     .insert(colaboradores)
-    .values({ nombre, rol, modalidad })
+    .values({ nombre, rol, modalidad, usuarioId: userId })
     .returning();
   revalidatePath("/");
   return row;
@@ -72,6 +80,7 @@ export async function updateCollaborator(
   id: number,
   patch: Partial<{ nombre: string; rol: Rol; modalidad: Modalidad }>,
 ) {
+  const userId = await requireSession();
   const cid = asId(id);
   if (!cid) return;
 
@@ -86,15 +95,20 @@ export async function updateCollaborator(
   if (modalidad) data.modalidad = modalidad;
   if (Object.keys(data).length === 0) return;
 
-  await db.update(colaboradores).set(data).where(eq(colaboradores.id, cid));
+  await db
+    .update(colaboradores)
+    .set(data)
+    .where(and(eq(colaboradores.id, cid), eq(colaboradores.usuarioId, userId)));
   revalidatePath("/");
 }
 
 export async function deleteCollaborator(id: number) {
+  const userId = await requireSession();
   const cid = asId(id);
   if (!cid) return;
-  // Las asignaciones se borran en cascada (FK onDelete: cascade).
-  await db.delete(colaboradores).where(eq(colaboradores.id, cid));
+  await db
+    .delete(colaboradores)
+    .where(and(eq(colaboradores.id, cid), eq(colaboradores.usuarioId, userId)));
   revalidatePath("/");
 }
 
@@ -103,10 +117,19 @@ export async function setShift(
   fecha: string,
   turno: Turno,
 ) {
+  const userId = await requireSession();
   const cid = asId(colaboradorId);
   const f = asFecha(fecha);
   const t = asTurno(turno);
   if (!cid || !f || !t) return;
+
+  // Verificar que el colaborador pertenece al usuario
+  const [colab] = await db
+    .select({ id: colaboradores.id })
+    .from(colaboradores)
+    .where(and(eq(colaboradores.id, cid), eq(colaboradores.usuarioId, userId)))
+    .limit(1);
+  if (!colab) return;
 
   await db
     .insert(asignaciones)
@@ -119,37 +142,63 @@ export async function setShift(
 }
 
 export async function autoPlan(monthIndex: number) {
+  const userId = await requireSession();
   const i = asMonthIndex(monthIndex);
   if (i === null) return;
 
-  const colabs = await colaboradoresActuales();
+  const colabs = await colaboradoresActuales(userId);
   const plan = buildPlan(i, colabs);
   const fechas = saturdaysForMonth(i).map((s) => s.key);
+  const colabIds = colabs.map((c) => c.id);
   const rows = plan.map((a) => ({
     colaboradorId: a.colaboradorId,
     fecha: a.fecha,
     turno: a.turno,
   }));
 
-  if (rows.length && fechas.length) {
-    // Atomicidad: borrar el mes e insertar la nueva propuesta en una sola
-    // transacción (db.batch), para no dejar el mes vacío si algo falla.
+  if (rows.length && fechas.length && colabIds.length) {
     await db.batch([
-      db.delete(asignaciones).where(inArray(asignaciones.fecha, fechas)),
+      db
+        .delete(asignaciones)
+        .where(
+          and(
+            inArray(asignaciones.fecha, fechas),
+            inArray(asignaciones.colaboradorId, colabIds),
+          ),
+        ),
       db.insert(asignaciones).values(rows),
     ]);
-  } else if (fechas.length) {
-    await db.delete(asignaciones).where(inArray(asignaciones.fecha, fechas));
+  } else if (fechas.length && colabIds.length) {
+    await db
+      .delete(asignaciones)
+      .where(
+        and(
+          inArray(asignaciones.fecha, fechas),
+          inArray(asignaciones.colaboradorId, colabIds),
+        ),
+      );
   }
   revalidatePath("/");
 }
 
 export async function clearMonth(monthIndex: number) {
+  const userId = await requireSession();
   const i = asMonthIndex(monthIndex);
   if (i === null) return;
+
+  const colabs = await colaboradoresActuales(userId);
+  const colabIds = colabs.map((c) => c.id);
   const fechas = saturdaysForMonth(i).map((s) => s.key);
-  if (fechas.length) {
-    await db.delete(asignaciones).where(inArray(asignaciones.fecha, fechas));
+
+  if (fechas.length && colabIds.length) {
+    await db
+      .delete(asignaciones)
+      .where(
+        and(
+          inArray(asignaciones.fecha, fechas),
+          inArray(asignaciones.colaboradorId, colabIds),
+        ),
+      );
   }
   revalidatePath("/");
 }

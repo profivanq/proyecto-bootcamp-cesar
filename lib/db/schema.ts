@@ -21,9 +21,19 @@ export const modalidadEnum = pgEnum("modalidad", ["Presencial", "Virtual"]);
 
 export const turnoEnum = pgEnum("turno", ["AM", "PM", "COMPLETO", "LIBRE"]);
 
-// Colaboradores del equipo
+// Usuarios del sistema (acceso multi-usuario)
+export const usuarios = pgTable("usuarios", {
+  id: serial("id").primaryKey(),
+  username: text("username").notNull().unique(),
+  passwordHash: text("password_hash").notNull(),
+  nombreDisplay: text("nombre_display").notNull(),
+  creadoEn: timestamp("creado_en", { withTimezone: true }).notNull().defaultNow(),
+});
+
+// Colaboradores del equipo (cada uno pertenece a un usuario)
 export const colaboradores = pgTable("colaboradores", {
   id: serial("id").primaryKey(),
+  usuarioId: integer("usuario_id").references(() => usuarios.id, { onDelete: "set null" }),
   nombre: text("nombre").notNull(),
   rol: rolEnum("rol").notNull().default("Ventas"),
   modalidad: modalidadEnum("modalidad").notNull().default("Presencial"),
@@ -31,8 +41,6 @@ export const colaboradores = pgTable("colaboradores", {
 });
 
 // Asignación de un turno a un colaborador en un sábado concreto.
-// La fecha (YYYY-MM-DD) codifica mes + sábado; un colaborador tiene como
-// máximo un turno por sábado (índice único).
 export const asignaciones = pgTable(
   "asignaciones",
   {
@@ -54,6 +62,8 @@ export const asignaciones = pgTable(
   }),
 );
 
+export type Usuario = typeof usuarios.$inferSelect;
+export type NuevoUsuario = typeof usuarios.$inferInsert;
 export type Colaborador = typeof colaboradores.$inferSelect;
 export type NuevoColaborador = typeof colaboradores.$inferInsert;
 export type Asignacion = typeof asignaciones.$inferSelect;
